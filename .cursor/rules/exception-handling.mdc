@@ -1,0 +1,334 @@
+---
+description: Rules for domain exception handling. Structured exceptions with error codes, factory methods for common errors, ExceptionUtil for processing, and a default catch-all handler. Apply whenever raising, catching, or defining exceptions. For converting exceptions to HTTP responses, see http-error-mapping rules.
+globs: ["**/domain/**/*.py", "**/services/**/*.py", "**/exceptions/**/*.py", "**/core/**/*.py", "**/handlers/**/*.py"]
+---
+
+# Exception Handling Rules
+
+## NEVER do these
+- NEVER raise bare `Exception` or `ValueError` from business logic.
+- NEVER catch `Exception` silently (`except Exception: pass`).
+- NEVER put HTTP status codes in domain exceptions — that belongs
+  in the HTTP mapping layer.
+- NEVER format stacktrace manually at raise site — ExceptionUtil
+  handles this at the handler level.
+- NEVER expose raw stacktrace in API responses (security risk).
+
+## File Structure
+
+```
+exceptions/
+├── base.py              # BaseAppException and ErrorCode
+├── domain_exceptions.py # All domain-specific exceptions
+├── exception_detail.py  # Serializable error detail (DTO)
+└── exception_util.py    # Utility for processing exceptions
+```
+
+## Step 1: ErrorCode Registry
+
+- ALL error codes MUST be defined in a single enum.
+- Format: `{DOMAIN}_{ERROR_NAME}` with numeric code.
+- Group by domain using numeric ranges.
+
+```python
+# exceptions/base.py
+from enum import StrEnum
+
+
+class ErrorCode(StrEnum):
+    # Generic (ERR_001 - ERR_099)
+    UNKNOWN_ERROR = "ERR_001"
+    VALIDATION_ERROR = "ERR_002"
+    UNAUTHORIZED = "ERR_003"
+    FORBIDDEN = "ERR_004"
+    EXTERNAL_SERVICE_ERROR = "ERR_005"
+
+    # Student domain (ERR_100 - ERR_199)
+    STUDENT_NOT_FOUND = "ERR_101"
+    STUDENT_ALREADY_EXISTS = "ERR_102"
+    STUDENT_ENROLLMENT_LIMIT = "ERR_103"
+
+    # Order domain (ERR_200 - ERR_299)
+    ORDER_NOT_FOUND = "ERR_201"
+    ORDER_ALREADY_CONFIRMED = "ERR_202"
+    ORDER_EMPTY_ITEMS = "ERR_203"
+
+    # Payment domain (ERR_300 - ERR_399)
+    PAYMENT_FAILED = "ERR_301"
+    PAYMENT_INSUFFICIENT_FUNDS = "ERR_302"
+```
+
+## Step 2: Base Exception Class
+
+- ALL application exceptions MUST inherit from `BaseAppException`.
+- Exception carries `error_code`, `message`, and optional `context` dict.
+- Stacktrace is NOT a constructor param — Python captures it
+  automatically. ExceptionUtil extracts it when needed.
+
+```python
+# exceptions/base.py (continued)
+
+class BaseAppException(Exception):
+    """Base exception for all application errors."""
+
+    def __init__(
+        self,
+        error_code: ErrorCode,
+        message: str,
+        context: dict | None = None,
+    ):
+        self._error_code = error_code
+        self._message = message
+        self._context = context or {}
+        super().__init__(message)
+
+    @property
+    def error_code(self) -> ErrorCode:
+        return self._error_code
+
+    @property
+    def message(self) -> str:
+        return self._message
+
+    @property
+    def context(self) -> dict:
+        return self._context.copy()
+```
+
+## Step 3: Domain Exceptions with Factory Methods
+
+- Each domain gets its own exception class inheriting BaseAppException.
+- Common error scenarios MUST have `@classmethod` factory methods.
+- Factory methods accept domain-relevant params and build the message.
+- Use `@classmethod` (not `@staticmethod`) because it returns `cls()`.
+
+```python
+# exceptions/domain_exceptions.py
+from exceptions.base import BaseAppException, ErrorCode
+
+
+class StudentException(BaseAppException):
+    """All student-related business errors."""
+
+    @classmethod
+    def not_found(cls, student_id: str) -> "StudentException":
+        return cls(
+            error_code=ErrorCode.STUDENT_NOT_FOUND,
+            message=f"Student with id '{student_id}' not found",
+            context={"student_id": student_id},
+        )
+
+    @classmethod
+    def already_exists(cls, email: str) -> "StudentException":
+        return cls(
+            error_code=ErrorCode.STUDENT_ALREADY_EXISTS,
+            message=f"Student with email '{email}' already exists",
+            context={"email": email},
+        )
+
+    @classmethod
+    def enrollment_limit_reached(
+        cls, student_id: str, current: int, max_allowed: int
+    ) -> "StudentException":
+        return cls(
+            error_code=ErrorCode.STUDENT_ENROLLMENT_LIMIT,
+            message=(
+                f"Student '{student_id}' has reached enrollment limit "
+                f"({current}/{max_allowed})"
+            ),
+            context={
+                "student_id": student_id,
+                "current_count": current,
+                "max_allowed": max_allowed,
+            },
+        )
+
+
+class OrderException(BaseAppException):
+    """All order-related business errors."""
+
+    @classmethod
+    def not_found(cls, order_id: str) -> "OrderException":
+        return cls(
+            error_code=ErrorCode.ORDER_NOT_FOUND,
+            message=f"Order '{order_id}' not found",
+            context={"order_id": order_id},
+        )
+
+    @classmethod
+    def already_confirmed(cls, order_id: str) -> "OrderException":
+        return cls(
+            error_code=ErrorCode.ORDER_ALREADY_CONFIRMED,
+            message=f"Order '{order_id}' is already confirmed and cannot be modified",
+            context={"order_id": order_id},
+        )
+
+    @classmethod
+    def empty_items(cls, order_id: str) -> "OrderException":
+        return cls(
+            error_code=ErrorCode.ORDER_EMPTY_ITEMS,
+            message=f"Order '{order_id}' has no items",
+            context={"order_id": order_id},
+        )
+
+
+class ExternalServiceException(BaseAppException):
+    """Errors from third-party integrations."""
+
+    @classmethod
+    def service_failed(
+        cls, service_name: str, operation: str, detail: str
+    ) -> "ExternalServiceException":
+        return cls(
+            error_code=ErrorCode.EXTERNAL_SERVICE_ERROR,
+            message=f"{service_name} failed during '{operation}': {detail}",
+            context={
+                "service": service_name,
+                "operation": operation,
+                "detail": detail,
+            },
+        )
+```
+
+### Usage in Service Layer
+
+```python
+# services/student_service.py
+
+class StudentService:
+    def get_student(self, student_id: str) -> Student:
+        student = self._repo.find_by_id(student_id)
+        if student.is_null():
+            raise StudentException.not_found(student_id)
+        return student
+
+    def enroll(self, student_id: str, course_id: str) -> None:
+        student = self.get_student(student_id)
+        current = self._enrollment_repo.count_by_student(student_id)
+        if current >= self._max_enrollments:
+            raise StudentException.enrollment_limit_reached(
+                student_id, current, self._max_enrollments
+            )
+        # ... proceed with enrollment
+```
+
+## Step 4: ExceptionDetail (Serializable DTO)
+
+- This is the structured representation of an error for logging
+  and response building.
+- Stacktrace is included for logging but NEVER sent to API clients.
+
+```python
+# exceptions/exception_detail.py
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field, ConfigDict
+from exceptions.base import ErrorCode
+
+
+class ExceptionDetail(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    error_code: ErrorCode
+    message: str
+    context: dict = Field(default_factory=dict)
+    stacktrace: str | None = Field(default=None)
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+```
+
+## Step 5: ExceptionUtil
+
+- Static utility for processing exceptions into ExceptionDetail.
+- Extracts stacktrace automatically — callers NEVER format it.
+- Provides safe sanitization for external-facing messages.
+
+```python
+# exceptions/exception_util.py
+import traceback
+import logging
+from exceptions.base import BaseAppException, ErrorCode
+from exceptions.exception_detail import ExceptionDetail
+
+logger = logging.getLogger(__name__)
+
+
+class ExceptionUtil:
+    def __init__(self):
+        raise RuntimeError("Utility class - do not instantiate")
+
+    @staticmethod
+    def to_detail(exc: BaseAppException) -> ExceptionDetail:
+        """Convert a known application exception to ExceptionDetail."""
+        return ExceptionDetail(
+            error_code=exc.error_code,
+            message=exc.message,
+            context=exc.context,
+            stacktrace=traceback.format_exception(exc)[-3:],
+        )
+
+    @staticmethod
+    def from_unhandled(exc: Exception) -> ExceptionDetail:
+        """Convert an unknown/unhandled exception to ExceptionDetail."""
+        logger.error(
+            f"Unhandled exception: {type(exc).__name__}: {exc}",
+            exc_info=exc,
+        )
+        return ExceptionDetail(
+            error_code=ErrorCode.UNKNOWN_ERROR,
+            message="An unexpected error occurred",
+            context={"exception_type": type(exc).__name__},
+            stacktrace="".join(traceback.format_exception(exc)),
+        )
+
+    @staticmethod
+    def sanitize_for_client(detail: ExceptionDetail) -> dict:
+        """Strip sensitive info (stacktrace, internal context) for API response."""
+        return {
+            "error_code": detail.error_code.value,
+            "message": detail.message,
+            "timestamp": detail.timestamp.isoformat(),
+        }
+
+    @staticmethod
+    def enrich_for_logging(detail: ExceptionDetail) -> dict:
+        """Full detail including stacktrace for internal logging."""
+        return detail.model_dump(mode="json")
+```
+
+## Step 6: Default Exception Handler
+
+- Register a catch-all handler at app startup.
+- ALL unhandled exceptions flow through here.
+- Known exceptions (BaseAppException) get structured handling.
+- Unknown exceptions get wrapped as UNKNOWN_ERROR and logged.
+
+```python
+# core/default_exception_handler.py
+import logging
+from exceptions.base import BaseAppException
+from exceptions.exception_util import ExceptionUtil
+
+logger = logging.getLogger(__name__)
+
+
+class DefaultExceptionHandler:
+    """
+    Catch-all handler. Integrate with your framework's error
+    handling mechanism (FastAPI, Flask, etc.).
+    Framework-specific HTTP mapping is in http-error-mapping rules.
+    """
+
+    @staticmethod
+    def handle(exc: Exception) -> dict:
+        if isinstance(exc, BaseAppException):
+            detail = ExceptionUtil.to_detail(exc)
+            logger.warning(
+                f"[{detail.error_code}] {detail.message}",
+                extra=ExceptionUtil.enrich_for_logging(detail),
+            )
+        else:
+            detail = ExceptionUtil.from_unhandled(exc)
+
+        return ExceptionUtil.sanitize_for_client(detail)
+```

@@ -1,0 +1,458 @@
+---
+description: Rules for integrating third-party APIs, SDKs, and external services (e.g., JIRA, Stripe, OpenAI, Twilio, SendGrid, Slack, any LLM provider, any REST/GraphQL API). Triggers when user asks to integrate, connect, call, or consume an external service. See pydantic-usage rules for DTO conventions. See dependency-and-extension rules for adapter/facade patterns.
+globs: ["**/integrations/**/*.py", "**/infrastructure/**/*.py", "**/adapters/**/*.py", "**/clients/**/*.py"]
+---
+
+# Third-Party Integration Rules
+
+## IMPORTANT: Before Writing Any Code
+- ASK the user: "Should this integration be SYNC or ASYNC?"
+- Do NOT assume async just because the project uses FastAPI.
+- The answer determines the entire class structure below.
+
+## File and Folder Structure
+
+Every third-party integration MUST follow this layout:
+
+```
+integrations/
+└── jira/                          # one folder per service
+    ├── jira_service.py            # Service class (entry point)
+    ├── jira_client.py             # HTTP/SDK wrapper (low-level calls)
+    ├── jira_adapter.py            # Domain ↔ DTO conversion
+    ├── dto/
+    │   ├── requests.py            # Pydantic request DTOs
+    │   └── responses.py           # Pydantic response DTOs
+    ├── exceptions.py              # Service-specific exceptions
+    └── config.py                  # Pydantic BaseSettings for this service
+```
+
+## Class Naming Convention
+- `{Service}Service` — Facade class, single entry point for the domain layer.
+- `{Service}Client` — Low-level HTTP/SDK calls only. No business logic.
+- `{Service}Adapter` — Converts between domain objects and DTOs.
+- `{Service}Config` — Pydantic BaseSettings for credentials and options.
+
+## Step-by-Step Implementation Order
+
+Follow this order. Do NOT skip steps.
+
+### Step 1: Config (Pydantic BaseSettings)
+
+```python
+# integrations/jira/config.py
+from pydantic import Field, ConfigDict
+from pydantic_settings import BaseSettings
+
+
+class JiraConfig(BaseSettings):
+    model_config = ConfigDict(env_prefix="JIRA_")
+
+    base_url: str = Field(..., description="JIRA instance URL")
+    api_token: str = Field(..., min_length=1, description="API token")
+    email: str = Field(..., description="Account email for auth")
+    timeout_seconds: int = Field(default=30, ge=5, le=120)
+    max_retries: int = Field(default=3, ge=0, le=5)
+```
+
+### Step 2: Request and Response DTOs (Pydantic BaseModel)
+
+- DTOs are Pydantic models — follow pydantic-usage rules.
+- DTOs MUST be frozen (immutable).
+- DTOs represent the EXTERNAL service's data shape, not your domain.
+- Use `alias` for mapping external field names to snake_case.
+
+```python
+# integrations/jira/dto/requests.py
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class CreateJiraIssueRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    project_key: str = Field(..., alias="projectKey", min_length=1)
+    summary: str = Field(..., max_length=255)
+    description: str = Field(default="")
+    issue_type: str = Field(default="Task", alias="issueType")
+    priority: str = Field(default="Medium")
+    assignee_email: str | None = Field(default=None, alias="assigneeEmail")
+```
+
+```python
+# integrations/jira/dto/responses.py
+from datetime import datetime
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class JiraIssueResponse(BaseModel):
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+
+    issue_id: str = Field(..., alias="id")
+    issue_key: str = Field(..., alias="key")
+    status: str
+    summary: str
+    created_at: datetime = Field(..., alias="createdAt")
+
+    @classmethod
+    def from_api_response(cls, raw: dict) -> "JiraIssueResponse":
+        """Factory method to handle messy/nested API responses."""
+        return cls(
+            id=raw["id"],
+            key=raw["key"],
+            status=raw["fields"]["status"]["name"],
+            summary=raw["fields"]["summary"],
+            createdAt=raw["fields"]["created"],
+        )
+```
+
+### Step 3: Service-Specific Exceptions
+
+```python
+# integrations/jira/exceptions.py
+
+class JiraIntegrationError(Exception):
+    """Base exception for all JIRA integration failures."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+class JiraAuthenticationError(JiraIntegrationError):
+    """Raised when API token or credentials are invalid."""
+    pass
+
+
+class JiraResourceNotFoundError(JiraIntegrationError):
+    """Raised when the requested resource does not exist."""
+    pass
+
+
+class JiraRateLimitError(JiraIntegrationError):
+    """Raised when API rate limit is exceeded."""
+
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"Rate limited. Retry after {retry_after_seconds}s")
+```
+
+### Step 4: Client (SYNC version)
+
+- Client handles ONLY HTTP/SDK calls and error mapping.
+- ZERO business logic. ZERO domain knowledge.
+- MUST implement retry with exponential backoff.
+- MUST map HTTP errors to service-specific exceptions.
+
+```python
+# integrations/jira/jira_client.py
+import httpx
+import time
+import logging
+from integrations.jira.config import JiraConfig
+from integrations.jira.dto.requests import CreateJiraIssueRequest
+from integrations.jira.dto.responses import JiraIssueResponse
+from integrations.jira.exceptions import (
+    JiraAuthenticationError,
+    JiraIntegrationError,
+    JiraRateLimitError,
+    JiraResourceNotFoundError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class JiraClient:
+    def __init__(self, config: JiraConfig):
+        self._config = config
+        self._http = httpx.Client(
+            base_url=config.base_url,
+            timeout=config.timeout_seconds,
+            auth=(config.email, config.api_token),
+            headers={"Content-Type": "application/json"},
+        )
+
+    def create_issue(self, request: CreateJiraIssueRequest) -> JiraIssueResponse:
+        raw = self._request(
+            method="POST",
+            path="/rest/api/3/issue",
+            payload=request.model_dump(by_alias=True, exclude_none=True),
+        )
+        return JiraIssueResponse.from_api_response(raw)
+
+    def get_issue(self, issue_key: str) -> JiraIssueResponse:
+        raw = self._request(method="GET", path=f"/rest/api/3/issue/{issue_key}")
+        return JiraIssueResponse.from_api_response(raw)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+    ) -> dict:
+        """Execute HTTP request with retry and error mapping."""
+        last_exception: Exception | None = None
+
+        for attempt in range(self._config.max_retries + 1):
+            try:
+                response = self._http.request(method, path, json=payload)
+                self._raise_for_status(response)
+                return response.json()
+
+            except JiraRateLimitError as e:
+                last_exception = e
+                wait = e.retry_after_seconds
+                logger.warning(f"Rate limited, retrying in {wait}s (attempt {attempt + 1})")
+                time.sleep(wait)
+
+            except JiraIntegrationError:
+                raise  # auth errors, not-found — don't retry
+
+            except httpx.TransportError as e:
+                last_exception = JiraIntegrationError(f"Network error: {e}")
+                wait = min(2 ** attempt, 30)  # exponential backoff, max 30s
+                logger.warning(f"Network error, retrying in {wait}s (attempt {attempt + 1})")
+                time.sleep(wait)
+
+        raise last_exception or JiraIntegrationError("Request failed after retries")
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
+        if response.status_code == 401:
+            raise JiraAuthenticationError("Invalid credentials", 401)
+        if response.status_code == 404:
+            raise JiraResourceNotFoundError("Resource not found", 404)
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "60"))
+            raise JiraRateLimitError(retry_after)
+        if response.status_code >= 400:
+            raise JiraIntegrationError(
+                f"API error {response.status_code}: {response.text}",
+                response.status_code,
+            )
+
+    def close(self) -> None:
+        self._http.close()
+```
+
+### Step 4 (ASYNC version — use ONLY if user confirms async)
+
+When async is needed, create ALL async helper infrastructure:
+
+```python
+# integrations/jira/jira_async_client.py
+import asyncio
+import logging
+import httpx
+from integrations.jira.config import JiraConfig
+from integrations.jira.dto.requests import CreateJiraIssueRequest
+from integrations.jira.dto.responses import JiraIssueResponse
+from integrations.jira.exceptions import (
+    JiraAuthenticationError,
+    JiraIntegrationError,
+    JiraRateLimitError,
+    JiraResourceNotFoundError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class JiraAsyncClient:
+    def __init__(self, config: JiraConfig):
+        self._config = config
+        self._http = httpx.AsyncClient(
+            base_url=config.base_url,
+            timeout=config.timeout_seconds,
+            auth=(config.email, config.api_token),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def create_issue(self, request: CreateJiraIssueRequest) -> JiraIssueResponse:
+        raw = await self._request(
+            method="POST",
+            path="/rest/api/3/issue",
+            payload=request.model_dump(by_alias=True, exclude_none=True),
+        )
+        return JiraIssueResponse.from_api_response(raw)
+
+    async def get_issue(self, issue_key: str) -> JiraIssueResponse:
+        raw = await self._request(method="GET", path=f"/rest/api/3/issue/{issue_key}")
+        return JiraIssueResponse.from_api_response(raw)
+
+    async def create_issues_batch(
+        self,
+        requests: list[CreateJiraIssueRequest],
+        max_concurrent: int = 5,
+    ) -> list[JiraIssueResponse]:
+        """Batch create with concurrency control."""
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def _create_with_limit(req: CreateJiraIssueRequest) -> JiraIssueResponse:
+            async with semaphore:
+                return await self.create_issue(req)
+
+        return await asyncio.gather(
+            *[_create_with_limit(req) for req in requests]
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+    ) -> dict:
+        """Execute async HTTP request with retry and exponential backoff."""
+        last_exception: Exception | None = None
+
+        for attempt in range(self._config.max_retries + 1):
+            try:
+                response = await self._http.request(method, path, json=payload)
+                self._raise_for_status(response)
+                return response.json()
+
+            except JiraRateLimitError as e:
+                last_exception = e
+                logger.warning(f"Rate limited, retrying in {e.retry_after_seconds}s")
+                await asyncio.sleep(e.retry_after_seconds)
+
+            except JiraIntegrationError:
+                raise
+
+            except httpx.TransportError as e:
+                last_exception = JiraIntegrationError(f"Network error: {e}")
+                wait = min(2 ** attempt, 30)
+                logger.warning(f"Network error, retrying in {wait}s")
+                await asyncio.sleep(wait)
+
+        raise last_exception or JiraIntegrationError("Request failed after retries")
+
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
+        if response.status_code == 401:
+            raise JiraAuthenticationError("Invalid credentials", 401)
+        if response.status_code == 404:
+            raise JiraResourceNotFoundError("Resource not found", 404)
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", "60"))
+            raise JiraRateLimitError(retry_after)
+        if response.status_code >= 400:
+            raise JiraIntegrationError(
+                f"API error {response.status_code}: {response.text}",
+                response.status_code,
+            )
+
+    async def close(self) -> None:
+        await self._http.aclose()
+```
+
+### Step 5: Adapter (Domain ↔ DTO Conversion)
+
+- Adapter converts between YOUR domain objects and external DTOs.
+- Domain layer NEVER imports from `dto/`. Only the adapter does.
+- All conversion logic lives HERE, not in the service or client.
+
+```python
+# integrations/jira/jira_adapter.py
+from integrations.jira.dto.requests import CreateJiraIssueRequest
+from integrations.jira.dto.responses import JiraIssueResponse
+from domain.entities.task import Task
+from domain.value_objects.task_status import TaskStatus
+
+
+class JiraAdapter:
+    """Converts between domain Task objects and JIRA DTOs."""
+
+    @staticmethod
+    def to_create_request(task: Task) -> CreateJiraIssueRequest:
+        return CreateJiraIssueRequest(
+            projectKey=task.get_project_code(),
+            summary=task.get_title(),
+            description=task.get_description(),
+            issueType=JiraAdapter._map_task_type(task.get_type()),
+            priority=JiraAdapter._map_priority(task.get_priority()),
+        )
+
+    @staticmethod
+    def to_domain(response: JiraIssueResponse) -> Task:
+        return Task(
+            external_id=response.issue_key,
+            title=response.summary,
+            status=JiraAdapter._map_status_to_domain(response.status),
+        )
+
+    @staticmethod
+    def _map_task_type(domain_type: str) -> str:
+        mapping = {"bug": "Bug", "feature": "Story", "chore": "Task"}
+        return mapping.get(domain_type, "Task")
+
+    @staticmethod
+    def _map_priority(domain_priority: str) -> str:
+        mapping = {"critical": "Highest", "high": "High", "medium": "Medium", "low": "Low"}
+        return mapping.get(domain_priority, "Medium")
+
+    @staticmethod
+    def _map_status_to_domain(jira_status: str) -> TaskStatus:
+        mapping = {
+            "To Do": TaskStatus.PENDING,
+            "In Progress": TaskStatus.IN_PROGRESS,
+            "Done": TaskStatus.COMPLETED,
+        }
+        return mapping.get(jira_status, TaskStatus.PENDING)
+```
+
+### Step 6: Service (Facade — Domain Entry Point)
+
+- Service is the ONLY class the domain layer interacts with.
+- Service depends on Client (via Protocol) and Adapter.
+- Service speaks domain language in, domain language out.
+- Catches integration exceptions, wraps into domain-relevant errors.
+
+```python
+# integrations/jira/jira_service.py
+import logging
+from integrations.jira.jira_adapter import JiraAdapter
+from integrations.jira.exceptions import JiraIntegrationError
+from domain.entities.task import Task
+from domain.exceptions import ExternalServiceError
+from typing import Protocol
+
+logger = logging.getLogger(__name__)
+
+
+class JiraClientProtocol(Protocol):
+    def create_issue(self, request) -> ...: ...
+    def get_issue(self, issue_key: str) -> ...: ...
+
+
+class JiraService:
+    def __init__(self, client: JiraClientProtocol):
+        self._client = client
+        self._adapter = JiraAdapter()
+
+    def create_task(self, task: Task) -> Task:
+        """Domain method: create a task in JIRA, return enriched domain object."""
+        try:
+            request = self._adapter.to_create_request(task)
+            response = self._client.create_issue(request)
+            return self._adapter.to_domain(response)
+
+        except JiraIntegrationError as e:
+            logger.error(f"Failed to create JIRA issue: {e}")
+            raise ExternalServiceError(
+                service="jira",
+                operation="create_task",
+                detail=str(e),
+            ) from e
+
+    def get_task(self, issue_key: str) -> Task:
+        try:
+            response = self._client.get_issue(issue_key)
+            return self._adapter.to_domain(response)
+
+        except JiraIntegrationError as e:
+            logger.error(f"Failed to fetch JIRA issue {issue_key}: {e}")
+            raise ExternalServiceError(
+                service="jira",
+                operation="get_task",
+                detail=str(e),
+            ) from e
+```

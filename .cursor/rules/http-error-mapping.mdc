@@ -1,0 +1,277 @@
+---
+description: Rules for converting domain exceptions into HTTP error responses. Maps ErrorCode to HTTP status codes and registers FastAPI exception handlers. See exception-handling rules for domain exception structure. NEVER put HTTP concerns in domain exceptions.
+globs: ["**/api/**/*.py", "**/routes/**/*.py", "**/middleware/**/*.py"]
+---
+
+# HTTP Error Mapping Rules
+
+## Core Principle
+- Domain exceptions know NOTHING about HTTP.
+- HTTP status code mapping is defined ONLY in this layer.
+- This is a one-way dependency: HTTP layer → Domain exceptions.
+  NEVER the reverse.
+
+## File Structure
+
+```
+api/
+├── error_mapping.py        # ErrorCode → HTTP status mapping
+├── error_response.py       # Pydantic HTTP error response schema
+└── exception_handlers.py   # FastAPI exception handler registration
+```
+
+## Step 1: HTTP Error Response Schema
+
+- This is the Pydantic model that API clients receive.
+- NEVER includes stacktrace, internal context, or server details.
+
+```python
+# api/error_response.py
+from datetime import datetime
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class HttpErrorResponse(BaseModel):
+    """Standard error response returned to API clients."""
+    model_config = ConfigDict(frozen=True)
+
+    error_code: str = Field(
+        ...,
+        description="Application error code",
+        examples=["ERR_101"],
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable error description",
+    )
+    timestamp: str = Field(
+        ...,
+        description="ISO 8601 timestamp",
+    )
+
+
+class ValidationErrorItem(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    field: str
+    message: str
+    value: str | None = None
+
+
+class HttpValidationErrorResponse(BaseModel):
+    """Structured validation error response with per-field details."""
+    model_config = ConfigDict(frozen=True)
+
+    error_code: str = Field(default="ERR_002")
+    message: str = Field(default="Validation failed")
+    errors: list[ValidationErrorItem]
+    timestamp: str
+```
+
+## Step 2: ErrorCode → HTTP Status Mapping
+
+- SINGLE source of truth for all error-to-status mappings.
+- Default to 500 for unmapped codes — never let an unknown
+  error return 200.
+- Group by HTTP status for readability.
+
+```python
+# api/error_mapping.py
+from http import HTTPStatus
+from exceptions.base import ErrorCode
+
+
+# ErrorCode → HTTP status mapping
+ERROR_CODE_TO_HTTP_STATUS: dict[ErrorCode, int] = {
+    # 400 Bad Request
+    ErrorCode.VALIDATION_ERROR: HTTPStatus.BAD_REQUEST,
+    ErrorCode.ORDER_EMPTY_ITEMS: HTTPStatus.BAD_REQUEST,
+
+    # 401 Unauthorized
+    ErrorCode.UNAUTHORIZED: HTTPStatus.UNAUTHORIZED,
+
+    # 403 Forbidden
+    ErrorCode.FORBIDDEN: HTTPStatus.FORBIDDEN,
+
+    # 404 Not Found
+    ErrorCode.STUDENT_NOT_FOUND: HTTPStatus.NOT_FOUND,
+    ErrorCode.ORDER_NOT_FOUND: HTTPStatus.NOT_FOUND,
+
+    # 409 Conflict
+    ErrorCode.STUDENT_ALREADY_EXISTS: HTTPStatus.CONFLICT,
+    ErrorCode.ORDER_ALREADY_CONFIRMED: HTTPStatus.CONFLICT,
+
+    # 422 Unprocessable Entity
+    ErrorCode.STUDENT_ENROLLMENT_LIMIT: HTTPStatus.UNPROCESSABLE_ENTITY,
+
+    # 502 Bad Gateway (third-party failures)
+    ErrorCode.EXTERNAL_SERVICE_ERROR: HTTPStatus.BAD_GATEWAY,
+    ErrorCode.PAYMENT_FAILED: HTTPStatus.BAD_GATEWAY,
+
+    # 500 Internal Server Error (fallback)
+    ErrorCode.UNKNOWN_ERROR: HTTPStatus.INTERNAL_SERVER_ERROR,
+}
+
+DEFAULT_HTTP_STATUS = HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def get_http_status(error_code: ErrorCode) -> int:
+    return ERROR_CODE_TO_HTTP_STATUS.get(error_code, DEFAULT_HTTP_STATUS)
+```
+
+## Step 3: FastAPI Exception Handlers
+
+- Register ALL handlers at app startup in a single function.
+- Three handlers cover every case:
+  1. `BaseAppException` — known business errors
+  2. `RequestValidationError` — Pydantic/FastAPI validation
+  3. `Exception` — unhandled catch-all
+
+```python
+# api/exception_handlers.py
+import logging
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from exceptions.base import BaseAppException
+from exceptions.exception_util import ExceptionUtil
+from api.error_mapping import get_http_status
+from api.error_response import (
+    HttpErrorResponse,
+    HttpValidationErrorResponse,
+    ValidationErrorItem,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    """Call this once in app startup. Registers all error handlers."""
+
+    @app.exception_handler(BaseAppException)
+    async def handle_app_exception(
+        request: Request, exc: BaseAppException
+    ) -> JSONResponse:
+        detail = ExceptionUtil.to_detail(exc)
+        http_status = get_http_status(exc.error_code)
+
+        logger.warning(
+            f"[{detail.error_code}] {detail.message} | "
+            f"path={request.url.path} status={http_status}",
+            extra=ExceptionUtil.enrich_for_logging(detail),
+        )
+
+        response = HttpErrorResponse(
+            error_code=detail.error_code.value,
+            message=detail.message,
+            timestamp=detail.timestamp.isoformat(),
+        )
+
+        return JSONResponse(
+            status_code=http_status,
+            content=response.model_dump(),
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        errors = [
+            ValidationErrorItem(
+                field=" → ".join(str(loc) for loc in err["loc"]),
+                message=err["msg"],
+                value=str(err.get("input", "")),
+            )
+            for err in exc.errors()
+        ]
+
+        response = HttpValidationErrorResponse(
+            errors=errors,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+        logger.warning(
+            f"Validation error | path={request.url.path} | "
+            f"errors={len(errors)}",
+        )
+
+        return JSONResponse(
+            status_code=422,
+            content=response.model_dump(),
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unhandled_exception(
+        request: Request, exc: Exception
+    ) -> JSONResponse:
+        detail = ExceptionUtil.from_unhandled(exc)
+        sanitized = ExceptionUtil.sanitize_for_client(detail)
+
+        return JSONResponse(
+            status_code=500,
+            content=sanitized,
+        )
+```
+
+### Registration in main.py
+
+```python
+# main.py
+from fastapi import FastAPI
+from api.exception_handlers import register_exception_handlers
+
+app = FastAPI()
+register_exception_handlers(app)
+```
+
+## API Response Examples
+
+### Known Business Error (404)
+```json
+{
+    "error_code": "ERR_101",
+    "message": "Student with id 'stu_abc123' not found",
+    "timestamp": "2025-03-18T10:30:00Z"
+}
+```
+
+### Validation Error (422)
+```json
+{
+    "error_code": "ERR_002",
+    "message": "Validation failed",
+    "errors": [
+        {
+            "field": "body → email",
+            "message": "value is not a valid email address",
+            "value": "not-an-email"
+        },
+        {
+            "field": "body → age",
+            "message": "Input should be greater than 0",
+            "value": "-5"
+        }
+    ],
+    "timestamp": "2025-03-18T10:30:00Z"
+}
+```
+
+### Unhandled Error (500)
+```json
+{
+    "error_code": "ERR_001",
+    "message": "An unexpected error occurred",
+    "timestamp": "2025-03-18T10:30:00Z"
+}
+```
+
+## Rules for Adding New Exceptions
+
+When adding a new domain exception:
+1. Add the ErrorCode to the enum in `exceptions/base.py`
+2. Add the factory `@classmethod` to the domain exception class
+3. Add the ErrorCode → HTTP status mapping in `api/error_mapping.py`
+
+If step 3 is missed, the error will default to 500. This is
+intentional — failing safe is better than returning a wrong status.

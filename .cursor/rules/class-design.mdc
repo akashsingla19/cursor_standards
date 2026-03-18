@@ -1,0 +1,90 @@
+---
+description: Rules for designing and structuring behavior-rich classes (domain entities, services, use cases). For data classes, DTOs, API schemas, and config — use Pydantic instead. See pydantic-usage rules.
+globs: ["**/domain/**/*.py", "**/services/**/*.py", "**/use_cases/**/*.py"]
+---
+
+# Class Design Rules
+
+## File Organization
+- One class per file. File name must match class name in snake_case.
+  Example: `OrderProcessor` → `order_processor.py`
+- Exception: Small related dataclasses/enums used ONLY by the main class
+  can live in the same file.
+
+## Encapsulation
+- All instance attributes MUST be private (prefix with `_`).
+- Expose state ONLY through methods or @property when read access
+  is genuinely needed.
+- NEVER expose internal collections directly. Return copies or
+  immutable views.
+
+BAD:
+```python
+class Order:
+    def __init__(self):
+        self.items = []        # public, anyone can mutate
+        self.status = "draft"  # public, no validation
+```
+
+GOOD:
+```python
+class Order:
+    def __init__(self):
+        self._items: list[OrderItem] = []
+        self._status: OrderStatus = OrderStatus.DRAFT
+
+    @property
+    def status(self) -> OrderStatus:
+        return self._status
+
+    def get_items(self) -> tuple[OrderItem, ...]:
+        return tuple(self._items)  # immutable view
+```
+
+## Tell, Don't Ask
+- Do NOT query an object's state to make decisions outside it.
+- Instead, tell the object what to do and let it decide internally.
+- If you catch yourself writing `if obj.get_x() > something:`
+  outside the class, move that logic INTO the class as a method.
+
+BAD:
+```python
+# Asking the order, then deciding from outside
+if order.get_status() == OrderStatus.DRAFT and len(order.get_items()) > 0:
+    order.set_status(OrderStatus.CONFIRMED)
+```
+
+GOOD:
+```python
+# Telling the order to confirm itself — it owns its rules
+order.confirm()
+
+# Inside Order class:
+def confirm(self) -> None:
+    if self._status != OrderStatus.DRAFT:
+        raise InvalidOrderStateError("Can only confirm draft orders")
+    if not self._items:
+        raise InvalidOrderError("Cannot confirm empty order")
+    self._status = OrderStatus.CONFIRMED
+```
+
+## Utility Classes
+- Utility/helper classes MUST use @staticmethod for all methods.
+- NEVER instantiate utility classes. Add a private constructor
+  or make it a module-level collection of functions instead.
+- Prefer module-level functions over utility classes when there
+  is no logical grouping.
+
+```python
+class PriceCalculator:
+    def __init__(self):
+        raise RuntimeError("Utility class - do not instantiate")
+
+    @staticmethod
+    def calculate_tax(amount: Decimal, tax_rate: Decimal) -> Decimal:
+        return amount * tax_rate
+
+    @staticmethod
+    def apply_discount(amount: Decimal, discount_pct: Decimal) -> Decimal:
+        return amount * (1 - discount_pct / 100)
+```

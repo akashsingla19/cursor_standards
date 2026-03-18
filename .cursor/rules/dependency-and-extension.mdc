@@ -1,0 +1,150 @@
+---
+description: Dependency Inversion, Open/Closed, and Interface Segregation principles. Apply when creating services, integrations, or any class that depends on external systems.
+globs: ["**/*.py"]
+---
+
+# Dependency & Extension Rules
+
+## Dependency Inversion (SOLID - D)
+- Service classes MUST depend on abstractions (Protocol/ABC),
+  never on concrete implementations.
+- Define protocols in the domain layer. Implement in infrastructure.
+- Inject dependencies through __init__, never instantiate them inside.
+
+BAD:
+```python
+class OrderService:
+    def __init__(self):
+        self._repo = PostgresOrderRepository()  # hardcoded concrete class
+        self._notifier = SmtpEmailNotifier()     # hardcoded
+```
+
+GOOD:
+```python
+class OrderService:
+    def __init__(
+        self,
+        repo: OrderRepository,       # Protocol/ABC
+        notifier: OrderNotifier,     # Protocol/ABC
+    ):
+        self._repo = repo
+        self._notifier = notifier
+```
+
+## Protocol Definition Pattern
+- Place protocols in `domain/protocols/` or alongside domain entities.
+- Use `typing.Protocol` (not ABC) unless you need shared implementation.
+- Protocol names describe capability, not implementation.
+
+```python
+# domain/protocols/order_repository.py
+from typing import Protocol
+
+class OrderRepository(Protocol):
+    def find_by_id(self, order_id: str) -> Order: ...
+    def save(self, order: Order) -> None: ...
+
+# infrastructure/persistence/postgres_order_repository.py
+class PostgresOrderRepository:  # no explicit inherit needed for Protocol
+    def find_by_id(self, order_id: str) -> Order:
+        # actual implementation
+        ...
+
+    def save(self, order: Order) -> None:
+        # actual implementation
+        ...
+```
+
+## Open/Closed (SOLID - O)
+- When adding new behavior to a category (e.g., new payment type,
+  new export format), add a NEW class — do NOT modify existing
+  if/elif chains.
+- Use Strategy pattern or registry pattern for extensible behavior.
+
+BAD (modifying existing code to add behavior):
+```python
+def process_payment(self, payment_type: str, amount: Decimal):
+    if payment_type == "credit":
+        ...
+    elif payment_type == "upi":
+        ...
+    elif payment_type == "wallet":   # added new elif — violates O/C
+        ...
+```
+
+GOOD (extend by adding new class):
+```python
+# Define the strategy protocol
+class PaymentProcessor(Protocol):
+    def process(self, amount: Decimal) -> PaymentResult: ...
+
+# Each type is its own class
+class CreditCardProcessor:
+    def process(self, amount: Decimal) -> PaymentResult: ...
+
+class UpiProcessor:
+    def process(self, amount: Decimal) -> PaymentResult: ...
+
+class WalletProcessor:  # just add new class, no existing code modified
+    def process(self, amount: Decimal) -> PaymentResult: ...
+
+# Registry pattern for lookup
+class PaymentProcessorRegistry:
+    def __init__(self):
+        self._processors: dict[str, PaymentProcessor] = {}
+
+    def register(self, payment_type: str, processor: PaymentProcessor) -> None:
+        self._processors[payment_type] = processor
+
+    def get(self, payment_type: str) -> PaymentProcessor:
+        if payment_type not in self._processors:
+            raise UnsupportedPaymentTypeError(payment_type)
+        return self._processors[payment_type]
+```
+
+## Interface Segregation (SOLID - I)
+- Keep protocols/interfaces small and focused.
+- If a class only needs to read, don't force it to depend on
+  an interface that includes write methods.
+- Split large interfaces into role-specific ones.
+
+BAD:
+```python
+class OrderRepository(Protocol):
+    def find_by_id(self, id: str) -> Order: ...
+    def find_all(self) -> list[Order]: ...
+    def save(self, order: Order) -> None: ...
+    def delete(self, id: str) -> None: ...
+    def generate_report(self) -> Report: ...  # unrelated concern
+```
+
+GOOD:
+```python
+class OrderReader(Protocol):
+    def find_by_id(self, id: str) -> Order: ...
+    def find_all(self) -> list[Order]: ...
+
+class OrderWriter(Protocol):
+    def save(self, order: Order) -> None: ...
+    def delete(self, id: str) -> None: ...
+
+# Concrete class implements both, but consumers depend on only what they need
+class PostgresOrderRepository:
+    def find_by_id(self, id: str) -> Order: ...
+    def find_all(self) -> list[Order]: ...
+    def save(self, order: Order) -> None: ...
+    def delete(self, id: str) -> None: ...
+
+# This service only needs reading
+class OrderReportService:
+    def __init__(self, reader: OrderReader):  # only depends on reader
+        self._reader = reader
+```
+
+## Guard Rails — Preventing Over-Engineering
+- Do NOT create a Protocol/interface unless there are or will
+  likely be at least two implementations (e.g., real + test mock).
+- Do NOT use Strategy pattern for categories with fewer than 3 types
+  and no expectation of growth. Simple if/else is fine for 2 cases.
+- Do NOT create abstract base classes for "future extensibility"
+  that has no concrete near-term use case.

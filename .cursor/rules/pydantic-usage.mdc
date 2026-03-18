@@ -1,0 +1,206 @@
+---
+description: Pydantic usage rules for data models, schemas, validation, and configuration. For domain entities with business logic — use regular classes instead. See class-design rules.
+globs: ["**/schemas/**/*.py", "**/dto/**/*.py", "**/config/**/*.py", "**/api/**/*.py", "**/routes/**/*.py"]
+---
+
+# Pydantic Usage Rules
+
+## When to Use Pydantic vs Regular Classes
+
+USE PYDANTIC (BaseModel) for:
+- API request/response schemas
+- DTOs (Data Transfer Objects) between layers
+- Configuration and settings (BaseSettings)
+- Value Objects with validation but minimal behavior
+- External data parsing (JSON, CSV, API responses)
+- Database model mapping (input/output at repository boundary)
+
+USE REGULAR CLASSES for:
+- Domain entities with business logic and behavior
+- Service classes
+- Classes where Tell Don't Ask principle applies
+- Classes needing private mutable state
+
+## Model Definition
+- ALWAYS inherit from `pydantic.BaseModel` for data classes.
+- ALWAYS use type annotations for every field.
+- ALWAYS use `Field()` for validation, defaults, and documentation.
+- NEVER use `dict` or raw `dataclass` for data that crosses a
+  boundary (API, DB, external service).
+- ALWAYS use `model_config = ConfigDict(...)` instead of
+  inner `class Config:` (deprecated).
+
+BAD:
+```python
+class CreateOrderRequest:
+    def __init__(self, customer_id, items, notes=None):
+        self.customer_id = customer_id  # no validation
+        self.items = items              # could be anything
+        self.notes = notes
+```
+
+GOOD:
+```python
+from pydantic import BaseModel, Field, ConfigDict
+
+class CreateOrderRequest(BaseModel):
+    model_config = ConfigDict(strict=True, frozen=True)
+
+    customer_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=36,
+        description="UUID of the customer",
+    )
+    items: list[OrderItemSchema] = Field(
+        ...,
+        min_length=1,
+        description="At least one item required",
+    )
+    notes: str | None = Field(
+        default=None,
+        max_length=500,
+    )
+```
+
+## Immutability
+- API schemas and value objects MUST use `frozen=True`.
+- Only use mutable models when building/accumulating state is
+  genuinely required.
+
+```python
+class MoneyValue(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    amount: Decimal = Field(..., ge=0)
+    currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+```
+
+## Validation
+- Use `field_validator` for single-field rules.
+- Use `model_validator` for cross-field rules.
+- Validators MUST raise `ValueError` with clear messages.
+- NEVER put business logic in validators — only structural/format
+  validation belongs here.
+
+```python
+from pydantic import field_validator, model_validator
+
+class DateRangeSchema(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    start_date: date
+    end_date: date
+
+    @field_validator("start_date")
+    @classmethod
+    def start_not_in_past(cls, v: date) -> date:
+        if v < date.today():
+            raise ValueError("Start date cannot be in the past")
+        return v
+
+    @model_validator(mode="after")
+    def end_after_start(self) -> "DateRangeSchema":
+        if self.end_date <= self.start_date:
+            raise ValueError("end_date must be after start_date")
+        return self
+```
+
+## Serialization
+- Use `model_dump()` not `.dict()` (deprecated).
+- Use `model_dump_json()` not `json.dumps(obj.dict())`.
+- Use `exclude_none=True` when sending API responses.
+- Define `alias` for external API field mapping, use
+  `populate_by_name=True` in config.
+
+```python
+class ExternalVendorResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    product_name: str = Field(..., alias="productName")
+    unit_price: Decimal = Field(..., alias="unitPrice")
+```
+
+## Nested Models
+- ALWAYS define nested schemas as separate Pydantic models.
+- NEVER use raw `dict` inside a Pydantic model.
+
+BAD:
+```python
+class OrderResponse(BaseModel):
+    customer: dict          # no validation, no structure
+    items: list[dict]       # untyped
+```
+
+GOOD:
+```python
+class CustomerSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    customer_id: str
+    name: str
+
+class OrderItemSummary(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    product_id: str
+    quantity: int = Field(..., gt=0)
+    unit_price: Decimal
+
+class OrderResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    customer: CustomerSummary
+    items: list[OrderItemSummary]
+```
+
+## Configuration / Settings
+- ALWAYS use `pydantic_settings.BaseSettings` for app config.
+- Use `env_prefix` to namespace environment variables.
+
+```python
+from pydantic_settings import BaseSettings
+from pydantic import Field
+
+class DatabaseSettings(BaseSettings):
+    model_config = ConfigDict(env_prefix="DB_")
+
+    host: str = Field(default="localhost")
+    port: int = Field(default=5432, ge=1, le=65535)
+    name: str
+    password: str = Field(..., min_length=8)
+```
+
+## Enum Usage
+- Pair enums with Pydantic for type-safe status/type fields.
+- Use StrEnum for string-serializable enums.
+
+```python
+from enum import StrEnum
+
+class OrderStatus(StrEnum):
+    DRAFT = "draft"
+    CONFIRMED = "confirmed"
+    SHIPPED = "shipped"
+
+class OrderResponse(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    status: OrderStatus
+```
+
+## FastAPI Integration
+- Use Pydantic models directly as request/response types in
+  route signatures.
+- Define separate Request and Response models — never reuse the
+  same model for both directions.
+
+```python
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.post("/orders", response_model=OrderResponse, status_code=201)
+async def create_order(request: CreateOrderRequest) -> OrderResponse:
+    ...
+```

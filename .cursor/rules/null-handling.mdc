@@ -1,0 +1,90 @@
+---
+description: Null Object pattern for domain and state classes. Eliminates None checks by providing safe default objects with neutral behavior.
+globs: ["**/domain/**/*.py", "**/models/**/*.py"]
+---
+
+# Null Object Pattern for Domain Classes
+
+## Rule
+- Every domain entity and value object MUST define a class-level
+  `null()` factory method that returns a safe empty/default instance.
+- MUST provide an `is_null()` method to check null status.
+- The null object MUST be safe to call any method on without raising
+  exceptions. Methods should return neutral values (empty string,
+  zero, empty list).
+- NEVER use `None` to represent "absence" of a domain object.
+  Use the null object instead.
+
+## Implementation Pattern
+
+```python
+class Customer:
+    def __init__(self, customer_id: str, name: str, email: str):
+        self._customer_id = customer_id
+        self._name = name
+        self._email = email
+        self._is_null = False
+
+    @classmethod
+    def null(cls) -> "Customer":
+        instance = cls(customer_id="", name="Unknown", email="")
+        instance._is_null = True
+        return instance
+
+    def is_null(self) -> bool:
+        return self._is_null
+
+    def get_display_name(self) -> str:
+        return self._name  # Returns "Unknown" for null, safe to call
+```
+
+## Usage
+
+BAD:
+```python
+customer = repository.find_by_id(customer_id)
+if customer is not None:       # None checks scattered everywhere
+    name = customer.get_name()
+else:
+    name = "Unknown"
+```
+
+GOOD:
+```python
+customer = repository.find_by_id(customer_id)  # returns Customer.null() if not found
+name = customer.get_display_name()  # always safe, no None check needed
+
+# When you explicitly need to check:
+if customer.is_null():
+    logger.warning(f"Customer {customer_id} not found")
+```
+
+## Null Handling at Pydantic Boundaries
+
+- At API/DTO layer, use `Optional` + `Field(default=None)` for
+  nullable fields. This is the ONLY place `None` is acceptable.
+- Repository methods MUST convert `None` results into Null Objects
+  before returning to the domain layer.
+- The domain layer NEVER sees `None` — only Null Objects.
+
+```python
+# Schema layer (Pydantic) — None is fine here
+class CustomerResponse(BaseModel):
+    customer_id: str
+    name: str
+    email: str | None = Field(default=None)
+
+# Repository — converts None to Null Object at the boundary
+class CustomerRepository:
+    def find_by_id(self, customer_id: str) -> Customer:
+        row = self._db.fetch(customer_id)
+        if row is None:
+            return Customer.null()    # boundary conversion
+        return CustomerMapper.to_domain(row)
+
+# Domain service — never deals with None
+class CustomerService:
+    def get_display_info(self, customer_id: str) -> str:
+        customer = self._repo.find_by_id(customer_id)
+        return customer.get_display_name()  # always safe
+```
