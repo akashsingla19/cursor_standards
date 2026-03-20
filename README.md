@@ -39,6 +39,59 @@ Use these rules in Cursor projects to enforce consistent architecture and code q
 3. Apply only rules relevant to the project stack (mostly Python/FastAPI-oriented).
 4. Iterate on rule text as team conventions evolve.
 
+## First-time setup
+
+Run these once after cloning to ensure this repo's git hook is active:
+
+```bash
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-commit
+```
+
+Optional verification:
+
+```bash
+git config --get core.hooksPath
+ls -l .githooks/pre-commit
+```
+
+## Scan-and-commit workflow
+
+This repository expects commits to go through Cursor's `scan-and-commit` command so staged changes are checked for secrets before commit.
+
+### Expected flow
+
+1. Stage your changes first.
+2. Run the Cursor command `scan-and-commit` and provide a commit message.
+3. The command inspects staged diff (`git diff --cached --diff-filter=ACMR`).
+4. If nothing is staged, the command reports that and stops.
+5. If files are staged, it scans every added line (`+`) using `.cursor/rules/secret-scanner.mdc`.
+6. The scanner returns either:
+   - `VERDICT: REJECTED` - findings are shown and commit is blocked.
+   - `VERDICT: APPROVED` - a temporary `.commit-approved` token is created and `git commit -m "$input"` is run.
+7. The pre-commit hook checks for `.commit-approved`:
+   - if present, it allows the commit and deletes the token;
+   - if absent, it blocks direct commit attempts.
+
+### Quick command sequence
+
+```bash
+git add .
+# In Cursor command palette, run: scan-and-commit
+```
+
+```bash
+# Optional: inspect exactly what will be scanned
+git diff --cached --diff-filter=ACMR
+```
+
+### Troubleshooting
+
+- Direct `git commit` is blocked by `.githooks/pre-commit` unless `.commit-approved` exists.
+- If scan result is `REJECTED`, fix findings, re-stage files, and run `scan-and-commit` again.
+- If you see "Nothing staged", run `git add <files>` first, then rerun `scan-and-commit`.
+- The `.commit-approved` file is temporary and auto-deleted by the hook after an approved commit.
+
 ## Design principles enforced
 
 - Domain exceptions must be HTTP-agnostic.
