@@ -1,0 +1,24 @@
+#!/bin/sh
+# Pre-commit hook — blocks all commits unless approved by Cursor
+# No regex, no API — just checks for the approval token file
+# The Cursor "scan-and-commit" command creates this file after LLM approval
+
+APPROVAL_FILE=".commit-approved"
+
+if [ -f "$APPROVAL_FILE" ]; then
+    rm -f "$APPROVAL_FILE"
+    exit 0
+fi
+
+echo ""
+echo "🚫 Direct git commit is blocked."
+echo ""
+echo "   Use Cursor command: scan-and-commit"
+echo "   This ensures secrets are scanned by LLM before committing."
+echo ""
+echo "   The command will:"
+echo "   1. Scan your staged changes for secrets"
+echo "   2. Block if secrets found"
+echo "   3. Commit if clean"
+echo ""
+exit 1
